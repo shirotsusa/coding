@@ -35,16 +35,20 @@ class BronzeConfig:
     # xlsmのシート名（= data_type 大カテゴリ）
     sheet_names: list[str]
 
-    # FetchBR内部並列度 = input_dictのkey数
+    # FetchBR内部並列度 = input_dictのkey数（waveに分割して制御）
     max_jobs_per_call: int = 8
 
-    # typeコード（API用）→ dataset（管理用）
-    # 例: {"ROW":"chips","WAFER":"wafers","LOT":"lots"}
-    type_to_dataset: dict[str, str] | None = None
+    # cls（粒度）デフォルト
+    default_cls: str = "ROW"  # 基本ROW
 
-    # typeごとの投入ID数（job粒度）
-    # 例: {"ROW": 1000, "WAFER": 1000, "LOT": 50}
-    ids_per_job_by_type: dict[str, int] | None = None
+    # シートごとにclsを上書きしたい場合（例：IQCだけWAFERなど）
+    sheet_to_cls_overrides: dict[str, str] | None = None
+
+    # cls -> dataset（ディレクトリ用）
+    cls_to_dataset: dict[str, str] | None = None  # 例: {"ROW":"chips","WAFER":"wafers","LOT":"lots"}
+
+    # clsごとの投入ID数（job粒度）
+    ids_per_job_by_cls: dict[str, int] | None = None  # 例: {"ROW":1000, "WAFER":1000, "LOT":50}
 
     # 1 lot あたりの wafer 数（lot_id末尾3桁を 001..N に置換）
     wafers_per_lot: int = 25
@@ -52,10 +56,11 @@ class BronzeConfig:
     # Polars
     infer_schema_length: int = 10_000
 
-    # cls: search_patternsに必要。xlsm左3列に無いので、通常はシート名を使う。
-    sheet_to_cls: dict[str, str] | None = None
-
+    # tmp掃除（推奨）
     cleanup_tmp_files: bool = True
+
+    # 1列目（冗長type列）が本当にシート名と一致しているか検証するか
+    validate_redundant_type_col: bool = False
 
 
 def now_snapshot() -> str:
@@ -63,7 +68,7 @@ def now_snapshot() -> str:
 
 
 # =========================
-# パス生成（確定版構成）
+# パス生成
 # =========================
 def p_tmp_base(root: Path, snapshot: str) -> Path:
     return root / "tmp" / "ingest" / f"snapshot={snapshot}"
@@ -133,14 +138,8 @@ def extract_single_csv(zip_path: Path, out_csv: Path) -> None:
             shutil.copyfileobj(src, dst)
 
 def csv_to_parquet(csv_path: Path, pq_path: Path, *, infer_schema_length: int) -> None:
-    """
-    - lazy + sink_parquet（あれば）優先
-    - なければ collect → write_parquet
-    - 文字コード不明なので候補を試す
-    """
     pq_path.parent.mkdir(parents=True, exist_ok=True)
     enc_candidates = ["utf8", "utf8-lossy", "cp932", "shift_jis"]
-
     last_err: Exception | None = None
 
     def _sink(lf: pl.LazyFrame) -> None:
@@ -181,12 +180,12 @@ def csv_to_parquet(csv_path: Path, pq_path: Path, *, infer_schema_length: int) -
 
 def chunks(seq: list[str], n: int) -> Iterable[list[str]]:
     for i in range(0, len(seq), n):
-        yield seq[i:i+n]
+        yield seq[i:i + n]
 
 def iter_dict_chunks(d: dict, max_items: int) -> Iterable[dict]:
     items = list(d.items())
     for i in range(0, len(items), max_items):
-        yield dict(items[i:i+max_items])
+        yield dict(items[i:i + max_items])
 
 
 # =========================
@@ -194,8 +193,8 @@ def iter_dict_chunks(d: dict, max_items: int) -> Iterable[dict]:
 # =========================
 @dataclass(frozen=True)
 class IdPartition:
-    lot_bases: list[str]    # LOTタイプに投入するlot_id（末尾3文字除去）
-    wafer_ids: list[str]    # ROW/WAFERタイプに投入するwafer_id（lot_base + 001..N）
+    lot_bases: list[str]    # LOT投入用（lot_id末尾3文字除去）
+    wafer_ids: list[str]    # ROW/WAFER投入用（lot_base + 001..N）
 
 def _lot_base_from_lot_id(lot_id: str) -> str:
     if len(lot_id) < 3:
@@ -203,20 +202,18 @@ def _lot_base_from_lot_id(lot_id: str) -> str:
     return lot_id[:-3]
 
 def _wafer_ids_from_lot_base(lot_base: str, n: int) -> list[str]:
-    # 001..n を3桁ゼロ埋め
     return [f"{lot_base}{i:03d}" for i in range(1, n + 1)]
 
 def load_ids_by_edate(ids_csv: Path, wafers_per_lot: int) -> dict[str, IdPartition]:
     df = pl.read_csv(str(ids_csv), columns=["e_date", "lot_id"])
-
     out: dict[str, IdPartition] = {}
-    grouped = df.group_by("e_date").agg([pl.col("lot_id")]).to_dicts()
 
+    grouped = df.group_by("e_date").agg(pl.col("lot_id")).to_dicts()
     for row in grouped:
         e_date = str(row["e_date"])
         lot_ids = [str(x) for x in row["lot_id"]]
 
-        # lot_baseを出現順でユニーク化（同じlotが複数行あっても1回だけ扱う）
+        # lot_baseを出現順でユニーク化
         lot_bases: list[str] = []
         seen = set()
         for lid in lot_ids:
@@ -230,20 +227,16 @@ def load_ids_by_edate(ids_csv: Path, wafers_per_lot: int) -> dict[str, IdPartiti
         for base in lot_bases:
             wafer_ids.extend(_wafer_ids_from_lot_base(base, wafers_per_lot))
 
-        out[e_date] = IdPartition(
-            lot_bases=lot_bases,
-            wafer_ids=wafer_ids,
-        )
+        out[e_date] = IdPartition(lot_bases=lot_bases, wafer_ids=wafer_ids)
 
     return out
 
 
 # =========================
-# Specロード（xlsm: 左3列=type, ope, cols / ENABLEで抽出 / (type,ope)でcols束ね）
+# Specロード（xlsm: 左3列=冗長type, ope, cols / ENABLE抽出 / opeでcols束ね）
 # =========================
 @dataclass(frozen=True)
 class SpecGroup:
-    type_code: str
     ope: str
     cols: list[str]
 
@@ -259,7 +252,7 @@ def _enable_to_bool(v: Any) -> bool:
     s = str(v).strip().lower()
     return s in ("true", "1", "yes", "y", "t")
 
-def load_spec_groups(xlsm_path: Path, sheet_name: str) -> list[SpecGroup]:
+def load_spec_groups(xlsm_path: Path, sheet_name: str, validate_type_col: bool) -> list[SpecGroup]:
     df = pd.read_excel(xlsm_path, sheet_name=sheet_name)
     if "ENABLE" not in df.columns:
         raise ValueError(f"{sheet_name}: ENABLE列がありません")
@@ -268,23 +261,32 @@ def load_spec_groups(xlsm_path: Path, sheet_name: str) -> list[SpecGroup]:
     if enabled.empty:
         return []
 
+    # 左3列：冗長type, ope, cols
     type_col = enabled.columns[0]
-    ope_col  = enabled.columns[1]
+    ope_col = enabled.columns[1]
     cols_col = enabled.columns[2]
 
+    if validate_type_col:
+        # 空やNaNを除外して、シート名以外が混ざっていないかチェック
+        vals = enabled[type_col].dropna().astype(str).str.strip()
+        bad = vals[(vals != "") & (vals != sheet_name)].unique()
+        if len(bad) > 0:
+            raise ValueError(f"{sheet_name}: 左1列(冗長type)にシート名以外が混入: {bad}")
+
     groups: list[SpecGroup] = []
-    for (t, o), g in enabled.groupby([type_col, ope_col], dropna=False):
+    for ope, g in enabled.groupby([ope_col], dropna=False):
         cols_raw = [str(x) for x in g[cols_col].dropna().tolist()]
         cols = list(dict.fromkeys(cols_raw))  # 順序維持で重複除去
         if not cols:
             continue
-        groups.append(SpecGroup(type_code=str(t), ope=str(o), cols=cols))
+        groups.append(SpecGroup(ope=str(ope), cols=cols))
+
     return groups
 
 def write_enabled_columns_meta(root: Path, sheet: str, groups: list[SpecGroup]) -> str:
     payload = {
         "sheet_name": sheet,
-        "groups": [{"type": g.type_code, "ope": g.ope, "cols": g.cols} for g in groups],
+        "groups": [{"ope": g.ope, "cols": g.cols} for g in groups],
     }
     path = p_bronze_meta(root) / "specs" / f"data_type={sheet}" / "enabled_columns.json"
     write_json_atomic(path, payload)
@@ -292,61 +294,61 @@ def write_enabled_columns_meta(root: Path, sheet: str, groups: list[SpecGroup]) 
 
 
 # =========================
-# type→dataset、cls解決、job生成
+# cls/dataset解決、job生成
 # =========================
-def resolve_dataset(cfg: BronzeConfig, type_code: str) -> str:
-    if not cfg.type_to_dataset or type_code not in cfg.type_to_dataset:
-        raise ValueError(f"type_to_dataset 未設定/未登録: type={type_code}")
-    return cfg.type_to_dataset[type_code]
-
 def resolve_cls(cfg: BronzeConfig, sheet_name: str) -> str:
-    if cfg.sheet_to_cls and sheet_name in cfg.sheet_to_cls:
-        return cfg.sheet_to_cls[sheet_name]
-    return sheet_name
+    if cfg.sheet_to_cls_overrides and sheet_name in cfg.sheet_to_cls_overrides:
+        return cfg.sheet_to_cls_overrides[sheet_name]
+    return cfg.default_cls
 
-def ids_for_type(id_part: IdPartition, type_code: str) -> list[str]:
+def resolve_dataset(cfg: BronzeConfig, cls: str) -> str:
+    if not cfg.cls_to_dataset or cls not in cfg.cls_to_dataset:
+        raise ValueError(f"cls_to_dataset 未設定/未登録: cls={cls}")
+    return cfg.cls_to_dataset[cls]
+
+def ids_per_job(cfg: BronzeConfig, cls: str) -> int:
+    if not cfg.ids_per_job_by_cls or cls not in cfg.ids_per_job_by_cls:
+        raise ValueError(f"ids_per_job_by_cls 未設定/未登録: cls={cls}")
+    return int(cfg.ids_per_job_by_cls[cls])
+
+def ids_for_cls(id_part: IdPartition, cls: str) -> list[str]:
     # LOTはlot_base、それ以外はwafer_id
-    if type_code == "LOT":
+    if cls == "LOT":
         return id_part.lot_bases
     return id_part.wafer_ids
-
-def ids_per_job(cfg: BronzeConfig, type_code: str) -> int:
-    if not cfg.ids_per_job_by_type or type_code not in cfg.ids_per_job_by_type:
-        raise ValueError(f"ids_per_job_by_type 未設定/未登録: type={type_code}")
-    return int(cfg.ids_per_job_by_type[type_code])
 
 def build_input_dict(
     cfg: BronzeConfig,
     *,
-    sheet_name: str,
+    sheet_name: str,  # = data_type
     e_date: str,
     id_part: IdPartition,
     spec_groups: list[SpecGroup],
     tmp_download_dir: Path,
 ) -> dict[str, dict]:
-    cls_value = resolve_cls(cfg, sheet_name)
+    cls = resolve_cls(cfg, sheet_name)
+    dataset = resolve_dataset(cfg, cls)
+    per_job = ids_per_job(cfg, cls)
+    id_list = ids_for_cls(id_part, cls)
+
     input_dict: dict[str, dict] = {}
 
     for g in spec_groups:
-        dataset = resolve_dataset(cfg, g.type_code)
-        id_list = ids_for_type(id_part, g.type_code)
-        per_job = ids_per_job(cfg, g.type_code)
-
         for part_idx, id_chunk in enumerate(chunks(id_list, per_job)):
             job_key = (
                 f"{dataset}__{sheet_name}"
                 f"__ope={g.ope}"
-                f"__type={g.type_code}"
+                f"__cls={cls}"
                 f"__e_date={e_date}"
                 f"__part={part_idx:04d}"
             )
-            out_file = tmp_download_dir / f"{job_key}.download"  # 中身でzip/csv判定
+            out_file = tmp_download_dir / f"{job_key}.download"
 
             input_dict[job_key] = {
                 "lot_waf_list": id_chunk,
                 "search_patterns": {
-                    "type": g.type_code,  # ROW/WAFER/LOT
-                    "cls": cls_value,
+                    "type": sheet_name,  # data_type（シート名）
+                    "cls": cls,          # ROW/WAFER/LOT
                     "ope": g.ope,
                     "cols": g.cols,
                 },
@@ -362,7 +364,7 @@ def build_input_dict(
 # =========================
 def run_fetchbr(cfg: BronzeConfig, *, input_dict: dict) -> None:
     br = FetchBR(str(cfg.myid_ini_path), input_dict)
-    br.start()
+    br.start()  # 部分成功あり得る
 
 def normalize_one_job(
     cfg: BronzeConfig,
@@ -405,7 +407,8 @@ def normalize_one_job(
         source_format = "csv"
 
     sp = job["search_patterns"]
-    dataset = resolve_dataset(cfg, sp["type"])
+    cls = str(sp["cls"])
+    dataset = resolve_dataset(cfg, cls)
     ope = str(sp["ope"])
 
     raw_dir = p_bronze_raw_dir(cfg.project_root, dataset=dataset, data_type=sheet_name, ope=ope, e_date=e_date, snapshot=snapshot)
@@ -442,7 +445,7 @@ def normalize_one_job(
         "sheet_name": sheet_name,
         "dataset": dataset,
         "ope": ope,
-        "type_code": sp["type"],
+        "cls": cls,
         "e_date": e_date,
         "snapshot": snapshot,
         "source_format": source_format,
@@ -480,7 +483,7 @@ def update_catalog(cfg: BronzeConfig, records: list[dict]) -> None:
             "dataset": r.get("dataset"),
             "data_type": r.get("sheet_name"),
             "ope": r.get("ope"),
-            "type_code": r.get("type_code"),
+            "cls": r.get("cls"),
             "e_date": r.get("e_date"),
             "snapshot": r.get("snapshot"),
             "raw_path": r.get("raw_path"),
@@ -530,7 +533,8 @@ def write_lineage_meta(cfg: BronzeConfig, *, sheet_name: str, e_date: str, snaps
         "snapshot": snapshot,
         "data_type": sheet_name,
         "e_date": e_date,
-        "e_date_definition": "lot_level",
+        "default_cls": cfg.default_cls,
+        "sheet_to_cls_overrides": cfg.sheet_to_cls_overrides or {},
         "spec_hash": spec_hash,
         "xlsm_path": str(cfg.xlsm_path),
         "ids_csv": str(cfg.ids_csv),
@@ -539,19 +543,27 @@ def write_lineage_meta(cfg: BronzeConfig, *, sheet_name: str, e_date: str, snaps
 
 
 # =========================
-# _SUCCESS 判定（欠落があれば絶対に付けない）
+# _SUCCESS 判定（欠落があれば付けない）
 # =========================
 def _parse_job_key(job_key: str) -> tuple[str, str, str, str, str]:
+    """
+    job_key =
+      {dataset}__{sheet}
+      __ope=...
+      __cls=...
+      __e_date=...
+      __part=....
+    """
     parts = job_key.split("__")
     if len(parts) < 6:
-        raise ValueError(f"job_keyの形式が想定外: {job_key}")
+        raise ValueError(f"job_key形式が想定外: {job_key}")
 
     dataset = parts[0]
     sheet = parts[1]
     ope = next(p.split("=", 1)[1] for p in parts if p.startswith("ope="))
+    cls = next(p.split("=", 1)[1] for p in parts if p.startswith("cls="))
     e_date = next(p.split("=", 1)[1] for p in parts if p.startswith("e_date="))
-    part = next(p.split("=", 1)[1] for p in parts if p.startswith("part="))
-    return dataset, sheet, ope, e_date, part
+    return dataset, sheet, ope, cls, e_date
 
 def finalize_success_markers(
     cfg: BronzeConfig,
@@ -566,7 +578,9 @@ def finalize_success_markers(
     ok_by_dir: dict[tuple[str, str], set[str]] = {}
 
     for k in expected_job_keys:
-        dataset, sheet, ope, e_date, _ = _parse_job_key(k)
+        dataset, sheet, ope, cls, e_date = _parse_job_key(k)
+
+        # 念のため dataset は cls から再計算しても良いが、ここでは job_key を採用
         raw_dir = str(p_bronze_raw_dir(cfg.project_root, dataset=dataset, data_type=sheet, ope=ope, e_date=e_date, snapshot=snapshot))
         pq_dir  = str(p_bronze_pq_dir(cfg.project_root,  dataset=dataset, data_type=sheet, ope=ope, e_date=e_date, snapshot=snapshot))
         dkey = (raw_dir, pq_dir)
@@ -586,10 +600,10 @@ def finalize_success_markers(
 # メイン：Bronze生成
 # =========================
 def run_bronze(cfg: BronzeConfig) -> None:
-    if not cfg.type_to_dataset:
-        raise ValueError("type_to_dataset が必要です（ROW/WAFER/LOT の対応）")
-    if not cfg.ids_per_job_by_type:
-        raise ValueError("ids_per_job_by_type が必要です（type別のchunkサイズ）")
+    if not cfg.cls_to_dataset:
+        raise ValueError("cls_to_dataset が必要です（ROW/WAFER/LOT -> dataset）")
+    if not cfg.ids_per_job_by_cls:
+        raise ValueError("ids_per_job_by_cls が必要です（cls別 chunk サイズ）")
 
     snapshot = now_snapshot()
 
@@ -603,7 +617,7 @@ def run_bronze(cfg: BronzeConfig) -> None:
     ids_by_edate = load_ids_by_edate(cfg.ids_csv, cfg.wafers_per_lot)
 
     for sheet in cfg.sheet_names:
-        spec_groups = load_spec_groups(cfg.xlsm_path, sheet)
+        spec_groups = load_spec_groups(cfg.xlsm_path, sheet, cfg.validate_redundant_type_col)
         if not spec_groups:
             continue
 
@@ -668,18 +682,27 @@ if __name__ == "__main__":
         ids_csv=Path("config/ids.csv"),  # e_date, lot_id のみ
         sheet_names=["IQC", "DS_CAT", "DS_CHAR", "REPORT"],
         max_jobs_per_call=8,
-        type_to_dataset={
+
+        # 基本ROW、必要ならシート単位でWAFERに
+        default_cls="ROW",
+        sheet_to_cls_overrides={
+            # 例：IQCだけWAFERで取りたいとき
+            # "IQC": "WAFER",
+        },
+
+        cls_to_dataset={
             "ROW": "chips",
             "WAFER": "wafers",
             "LOT": "lots",
         },
-        ids_per_job_by_type={
+        ids_per_job_by_cls={
             "ROW": 1000,
             "WAFER": 1000,
             "LOT": 50,
         },
+
         wafers_per_lot=25,
-        sheet_to_cls=None,
         cleanup_tmp_files=True,
+        validate_redundant_type_col=False,
     )
     run_bronze(cfg)
