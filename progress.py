@@ -6,13 +6,13 @@ import json
 import math
 from pathlib import Path
 from collections import defaultdict
-from datetime import datetime, date
-
+from datetime import datetime
 
 RUNS = Path("lake/bronze/meta/runs/runs.jsonl")
 META = Path("lake/bronze/meta")
 
-# あなたの運用に合わせて調整（母数推定に使う）
+# 母数推定に使う「1 job あたりの対象ID数」
+# あなたの運用に合わせて調整してください（ROW/WAFERは wafer_id リストを分割する前提）
 IDS_PER_JOB_BY_CLS = {
     "ROW": 1000,
     "WAFER": 1000,
@@ -24,8 +24,27 @@ def read_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def pick_latest_snapshot(rows: list[dict]) -> str | None:
+def load_runs_rows() -> list[dict]:
+    if not RUNS.exists():
+        return []
+    return [json.loads(l) for l in RUNS.read_text(encoding="utf-8").splitlines() if l.strip()]
+
+
+def pick_latest_snapshot_from_runs(rows: list[dict]) -> str | None:
     snaps = [r.get("snapshot") for r in rows if r.get("snapshot")]
+    return max(snaps) if snaps else None
+
+
+def pick_latest_snapshot_from_partitions() -> str | None:
+    base = META / "partitions"
+    if not base.exists():
+        return None
+    snaps = set()
+    for p in base.glob("data_type=*/e_date=*/snapshot=*/lot_ids.json"):
+        try:
+            snaps.add(_get_part_value(p, "snapshot"))
+        except Exception:
+            pass
     return max(snaps) if snaps else None
 
 
@@ -47,58 +66,16 @@ def best_record(a: dict, b: dict) -> dict:
     return a if a.get("ts", "") >= b.get("ts", "") else b
 
 
-def parse_edate(s: str | None) -> date | None:
-    if not s:
-        return None
-    s = str(s).strip()
-    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"):
-        try:
-            return datetime.strptime(s, fmt).date()
-        except ValueError:
-            pass
-    return None
-
-
 def _get_part_value(path: Path, prefix: str) -> str:
     """
-    path（lot_ids.json）から上位を辿って、prefix=... の値を探す。
-    階層が変わっても落ちにくくするための保険。
+    path（lot_ids.json）から上位を辿って prefix=... の値を探す。
+    階層変更に強くするための保険。
     """
     for p in [path] + list(path.parents):
         name = p.name
         if name.startswith(prefix + "="):
             return name.split("=", 1)[1]
     raise ValueError(f"missing {prefix}=... in path: {path}")
-
-
-def get_current_edate_from_runs_tail(rows_all: list[dict], snapshot: str) -> tuple[str | None, dict | None]:
-    """
-    runs.jsonl の末尾から遡って snapshot一致の行を探し、e_date（あれば）を返す。
-    e_dateが無い行しか無い場合は job_key から e_date=... を拾う。
-    """
-    for r in reversed(rows_all):
-        if r.get("snapshot") != snapshot:
-            continue
-
-        ed = r.get("e_date")
-        if ed:
-            return str(ed), r
-
-        jk = r.get("job_key")
-        if jk and "__e_date=" in jk:
-            try:
-                ed2 = jk.split("__e_date=", 1)[1].split("__", 1)[0]
-                return ed2, r
-            except Exception:
-                pass
-
-    return None, None
-
-
-def resolve_cls(lineage: dict, data_type: str) -> str:
-    default_cls = lineage.get("default_cls", "ROW")
-    overrides = lineage.get("sheet_to_cls_overrides", {}) or {}
-    return overrides.get(data_type, default_cls)
 
 
 def count_ope_groups(data_type: str) -> int:
@@ -109,51 +86,49 @@ def count_ope_groups(data_type: str) -> int:
     return len(j.get("groups", []))
 
 
+def resolve_cls(snapshot: str, data_type: str, e_date: str) -> str | None:
+    lineage_path = META / "lineage" / f"data_type={data_type}" / f"e_date={e_date}" / f"snapshot={snapshot}" / "lineage.json"
+    if not lineage_path.exists():
+        return None
+    lineage = read_json(lineage_path)
+    default_cls = lineage.get("default_cls", "ROW")
+    overrides = lineage.get("sheet_to_cls_overrides", {}) or {}
+    return overrides.get(data_type, default_cls)
+
+
 def iter_partitions(snapshot: str):
     """
-    meta/partitions 配下から snapshot に一致する lot_ids.json を列挙する。
-    期待するパス例：
+    meta/partitions から snapshot に一致する lot_ids.json を列挙する。
+    期待する例：
       meta/partitions/data_type=DS_CHAR/e_date=2026-04-01/snapshot=.../lot_ids.json
     """
     base = META / "partitions"
     if not base.exists():
         return
-
     for lot_ids_json in base.glob(f"data_type=*/e_date=*/snapshot={snapshot}/lot_ids.json"):
         try:
             data_type = _get_part_value(lot_ids_json, "data_type")
             e_date = _get_part_value(lot_ids_json, "e_date")
             yield data_type, e_date, lot_ids_json
         except Exception:
-            # 解析不能はスキップ（issues側で拾う）
             yield None, None, lot_ids_json
 
 
 def expected_jobs_for_partition(snapshot: str, data_type: str, e_date: str, lot_ids_json: Path) -> tuple[int, dict]:
     """
     期待job数 = (opeグループ数) × ceil(対象ID数 / ids_per_job(cls))
-    対象ID数は cls により n_wafers / n_lots を切り替える。
+    対象ID数：cls=ROW/WAFER -> n_wafers, cls=LOT -> n_lots
     """
     if not data_type or not e_date:
         return 0, {"reason": "bad_partition_path", "path": str(lot_ids_json)}
-
-    lineage_path = META / "lineage" / f"data_type={data_type}" / f"e_date={e_date}" / f"snapshot={snapshot}" / "lineage.json"
-    if not lineage_path.exists():
-        return 0, {"reason": "missing_lineage", "data_type": data_type, "e_date": e_date}
-
-    lineage = read_json(lineage_path)
-    cls = resolve_cls(lineage, data_type)
 
     part = read_json(lot_ids_json)
     n_wafers = int(part.get("n_wafers", 0))
     n_lots = int(part.get("n_lots", 0))
 
-    if cls in ("ROW", "WAFER"):
-        n_ids = n_wafers
-    elif cls == "LOT":
-        n_ids = n_lots
-    else:
-        return 0, {"reason": "unknown_cls", "cls": cls, "data_type": data_type, "e_date": e_date}
+    cls = resolve_cls(snapshot, data_type, e_date)
+    if not cls:
+        return 0, {"reason": "missing_lineage", "data_type": data_type, "e_date": e_date}
 
     per_job = IDS_PER_JOB_BY_CLS.get(cls)
     if not per_job:
@@ -163,20 +138,29 @@ def expected_jobs_for_partition(snapshot: str, data_type: str, e_date: str, lot_
     if ope_groups == 0:
         return 0, {"reason": "missing_enabled_columns", "data_type": data_type, "e_date": e_date}
 
+    if cls in ("ROW", "WAFER"):
+        n_ids = n_wafers
+    elif cls == "LOT":
+        n_ids = n_lots
+    else:
+        return 0, {"reason": "unknown_cls", "cls": cls, "data_type": data_type, "e_date": e_date}
+
     n_chunks = math.ceil(n_ids / per_job) if n_ids > 0 else 0
-    exp = ope_groups * n_chunks
+    expected = ope_groups * n_chunks
 
     info = {
         "data_type": data_type,
         "e_date": e_date,
         "cls": cls,
+        "n_wafers": n_wafers,
+        "n_lots": n_lots,
         "n_ids": n_ids,
         "per_job": per_job,
         "n_chunks": n_chunks,
         "ope_groups": ope_groups,
-        "expected": exp,
+        "expected": expected,
     }
-    return exp, info
+    return expected, info
 
 
 def parse_job_key(jk: str) -> dict:
@@ -193,153 +177,134 @@ def parse_job_key(jk: str) -> dict:
     return out
 
 
-def load_rows() -> list[dict]:
-    if not RUNS.exists():
-        return []
-    return [json.loads(l) for l in RUNS.read_text(encoding="utf-8").splitlines() if l.strip()]
+def fmt_bar(ratio: float, width: int = 40) -> str:
+    ratio = 0.0 if ratio < 0 else (1.0 if ratio > 1 else ratio)
+    return ("#" * int(ratio * width)).ljust(width, "-")
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--snapshot", type=str, default=None, help="use specific snapshot (default: latest)")
+    ap.add_argument("--snapshot", type=str, default=None, help="対象snapshot（省略時はruns.jsonlの最新）")
     args = ap.parse_args()
 
-    rows_all = load_rows()
-    if not rows_all:
-        print("runs.jsonl not found or empty:", RUNS)
-        return
+    rows_all = load_runs_rows()
 
-    snap = args.snapshot or pick_latest_snapshot(rows_all)
+    # snapshot決定：基本はruns優先、runsが無ければpartitionsから
+    snap = args.snapshot
     if not snap:
-        print("No snapshot found.")
+        snap = pick_latest_snapshot_from_runs(rows_all) if rows_all else None
+    if not snap:
+        snap = pick_latest_snapshot_from_partitions()
+
+    if not snap:
+        print("snapshot が見つかりません（runs.jsonl/partitionsを確認してください）")
         return
 
-    # 末尾行から current e_date を拾う（運用上の“進行中目安”）
-    current_edate_str, current_rec = get_current_edate_from_runs_tail(rows_all, snap)
-    current_edate = parse_edate(current_edate_str) if current_edate_str else None
+    # --- 実績（runs）集計 ---
+    by_job: dict[str, dict] = {}
+    if rows_all:
+        rows = [r for r in rows_all if r.get("snapshot") == snap and r.get("job_key")]
+        for r in rows:
+            jk = r["job_key"]
+            by_job[jk] = r if jk not in by_job else best_record(by_job[jk], r)
 
-    # 最新snapshotのrunsを job_key 単位で統合
-    rows = [r for r in rows_all if r.get("snapshot") == snap and r.get("job_key")]
-    by: dict[str, dict] = {}
-    for r in rows:
-        jk = r["job_key"]
-        by[jk] = r if jk not in by else best_record(by[jk], r)
-
-    # 完了/失敗内訳
-    cnt = defaultdict(int)
     done = 0
     raw_only = 0
-    for r in by.values():
+    status_cnt = defaultdict(int)
+
+    for r in by_job.values():
         if r.get("parquet_path"):
             done += 1
-            cnt["parquet_ok"] += 1
+            status_cnt["parquet_ok"] += 1
         elif r.get("raw_path"):
             raw_only += 1
-            cnt["raw_only"] += 1
+            status_cnt["raw_only"] += 1
         else:
-            cnt[r.get("status", "unknown")] += 1
+            status_cnt[r.get("status", "unknown")] += 1
 
-    seen = len(by)
+    seen = len(by_job)
 
-    # 母数（期待job数）を meta/partitions から復元
-    expected = 0
+    # --- 母数（planned/expected）集計 ---
+    expected_total = 0
+    planned_partitions = 0
+    total_wafers = 0
+    total_lots = 0
+
     exp_detail: list[dict] = []
     issues: list[dict] = []
+    expected_by_cls = defaultdict(int)
+    expected_by_data_type = defaultdict(int)
 
     for data_type, e_date, lot_ids_json in iter_partitions(snap):
         exp, info = expected_jobs_for_partition(snap, data_type, e_date, lot_ids_json)
-        expected += exp
         if exp > 0:
+            expected_total += exp
+            planned_partitions += 1
+            total_wafers += int(info.get("n_wafers", 0))
+            total_lots += int(info.get("n_lots", 0))
             exp_detail.append(info)
+            expected_by_cls[str(info["cls"])] += exp
+            expected_by_data_type[str(info["data_type"])] += exp
         else:
             issues.append(info)
 
-    done_ratio = (done / expected) if expected else 0.0
-    seen_ratio = (seen / expected) if expected else 0.0
-    remaining = max(expected - done, 0)
-
-    bar_done = ("#" * int(done_ratio * 40)).ljust(40, "-")
-    bar_seen = ("#" * int(seen_ratio * 40)).ljust(40, "-")
-
+    # --- 出力 ---
     print(f"snapshot: {snap}")
-    print(f"expected jobs: {expected}")
-    print(f"done (parquet_ok): {done}   remaining: {remaining}")
-    print(f"seen (attempted unique jobs): {seen}   raw_only: {raw_only}")
-    print(f"[DONE {bar_done}] {done_ratio*100:.1f}%  (done/expected)")
-    print(f"[SEEN {bar_seen}] {seen_ratio*100:.1f}%  (seen/expected)")
+    print(f"planned partitions (data_type×e_date): {planned_partitions}")
+    print(f"planned lots:   {total_lots}")
+    print(f"planned wafers: {total_wafers}")
+    print(f"TOTAL expected jobs: {expected_total}")
 
-    for k in sorted(cnt.keys()):
-        if k not in ("parquet_ok", "raw_only"):
-            print(f"{k}: {cnt[k]}")
-
-    # ---- 追加：日付ベースのざっくり進捗（末尾行e_date vs 最大e_date） ----
-    planned_dates = sorted({parse_edate(x["e_date"]) for x in exp_detail if parse_edate(x["e_date"]) is not None})
-    max_edate = planned_dates[-1] if planned_dates else None
-
-    if planned_dates:
-        print("\nApprox progress by e_date (tail-based):")
-        print(f"  current_e_date (tail): {current_edate_str or 'N/A'}")
-        print(f"  max_planned_e_date:    {max_edate.isoformat() if max_edate else 'N/A'}")
-
-        if current_edate:
-            # 単純：日付の並び上の位置
-            idx = -1
-            for i, d in enumerate(planned_dates):
-                if d <= current_edate:
-                    idx = i
-            if idx >= 0:
-                date_ratio = (idx + 1) / len(planned_dates)
-                print(f"  date_position:         {idx+1}/{len(planned_dates)} ({date_ratio*100:.1f}%)")
-            else:
-                print("  date_position:         0/{} (0.0%)".format(len(planned_dates)))
-
-            # 重み付き：期待jobの累積比（e_date<=current の expected を足す）
-            cum_expected = 0
-            for x in exp_detail:
-                d = parse_edate(x.get("e_date"))
-                if d and d <= current_edate:
-                    cum_expected += int(x.get("expected", 0))
-            weighted_ratio = (cum_expected / expected) if expected else 0.0
-            print(f"  weighted_expected:     {cum_expected}/{expected} ({weighted_ratio*100:.1f}%)")
-
-            if current_rec and current_rec.get("job_key"):
-                print(f"  current_job_key:       {current_rec['job_key']}")
-        else:
-            print("  (skip: current_e_date could not be parsed or not found)")
+    if expected_total > 0:
+        done_ratio = done / expected_total
+        seen_ratio = seen / expected_total
+        print(f"\nProgress:")
+        print(f"  done (parquet_ok): {done:7d}/{expected_total:7d} [{fmt_bar(done_ratio)}] {done_ratio*100:5.1f}%")
+        print(f"  seen (attempted):  {seen:7d}/{expected_total:7d} [{fmt_bar(seen_ratio)}] {seen_ratio*100:5.1f}%")
+        print(f"  raw_only:          {raw_only:7d}")
     else:
-        print("\nApprox progress by e_date (tail-based):")
-        print("  (skip: no planned e_date found from partitions)")
+        print("\nProgress:")
+        print("  expected_total=0 のため割合を計算できません（meta/specs/lineage/partitionsの欠落を疑ってください）")
+        print(f"  done(parquet_ok): {done}, seen: {seen}, raw_only: {raw_only}")
 
-    # data_type別（どこが重いか）
-    dt_stat = defaultdict(lambda: {"expected": 0, "done": 0, "seen": 0})
-    for info in exp_detail:
-        dt_stat[info["data_type"]]["expected"] += int(info["expected"])
+    # 失敗内訳
+    if status_cnt:
+        print("\nRun status breakdown (runs.jsonl):")
+        for k in sorted(status_cnt.keys()):
+            if k not in ("parquet_ok", "raw_only"):
+                print(f"  {k}: {status_cnt[k]}")
 
-    for jk, r in by.items():
+    # cls別の予定job数
+    if expected_by_cls:
+        print("\nExpected jobs by cls:")
+        for cls, v in sorted(expected_by_cls.items(), key=lambda x: -x[1]):
+            print(f"  {cls:6s}: {v}")
+
+    # data_type別：予定と実績を並べる
+    # 実績側（done/seen）をdata_type別に数える
+    done_by_dt = defaultdict(int)
+    seen_by_dt = defaultdict(int)
+    for jk, r in by_job.items():
         k = parse_job_key(jk)
         dt = k.get("data_type")
         if not dt:
             continue
-        dt_stat[dt]["seen"] += 1
+        seen_by_dt[dt] += 1
         if r.get("parquet_path"):
-            dt_stat[dt]["done"] += 1
+            done_by_dt[dt] += 1
 
-    if dt_stat:
-        print("\nBy data_type:")
-        def _score(item):
-            s = item[1]
-            exp = s["expected"]
-            return (s["done"] / exp) if exp else -1
-
-        for dt, s in sorted(dt_stat.items(), key=_score):
-            exp = s["expected"]
-            d = s["done"]
-            se = s["seen"]
+    if expected_by_data_type:
+        print("\nBy data_type (expected vs done/seen):")
+        # expectedが多い順に表示
+        for dt, exp in sorted(expected_by_data_type.items(), key=lambda x: -x[1])[:30]:
+            d = done_by_dt.get(dt, 0)
+            s = seen_by_dt.get(dt, 0)
             rr = (d / exp * 100) if exp else 0.0
-            print(f"  {dt:12s}  done/expected={d:7d}/{exp:7d} ({rr:5.1f}%)  seen={se:7d}")
+            print(f"  {dt:12s} expected={exp:8d}  done={d:8d}  seen={s:8d}  done%={rr:5.1f}%")
 
+    # 計算から漏れたpartitionがあると expected_total が過小評価になるので警告
     if issues:
-        print("\n[WARN] Some partitions were skipped for expected-count calculation (expected may be undercounted):")
+        print("\n[WARN] Some partitions were skipped (expected_total may be undercounted):")
         for x in issues[:12]:
             print(" ", x)
         if len(issues) > 12:
