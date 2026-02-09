@@ -7,6 +7,8 @@ import json
 import math
 from collections import Counter, defaultdict
 from pathlib import Path
+from typing import Iterable
+
 
 # ---- Path base: script location (watchでも崩れない) ----
 ROOT = Path(__file__).resolve().parents[1]  # <repo>/scripts/progress.py を想定
@@ -68,7 +70,8 @@ def normalize_edate(s: str) -> str:
     s = (s or "").strip()
     if not s:
         return s
-    # "2025-04-17 06:13:38" / "2025/04/17 06:13:38" のように時刻が付くケースは先頭トークンだけ使う
+
+    # "2025-04-17 06:13:38" / "2025/04/17 06:13:38" などは日付部分だけ
     s = s.split()[0].strip()
 
     # 2025/04/17 -> 2025-04-17
@@ -77,10 +80,17 @@ def normalize_edate(s: str) -> str:
         if len(parts) == 3 and all(p.isdigit() for p in parts):
             y, m, d = parts
             return f"{int(y):04d}-{int(m):02d}-{int(d):02d}"
+
     # 20250417 -> 2025-04-17
     if len(s) == 8 and s.isdigit():
         return f"{s[:4]}-{s[4:6]}-{s[6:]}"
+
     return s
+
+
+def normalize_colname(s: str) -> str:
+    # UTF-8 BOM(\ufeff)がヘッダに付くケースの吸収
+    return (s or "").strip().lstrip("\ufeff").upper()
 
 
 def guess_ids_csv_path(explicit: str | None) -> Path | None:
@@ -123,33 +133,39 @@ def read_ids_counts_by_edate(
     lot_col: str = "LOT_ID",
     wafer_col: str = "WAFER_ID",
     wafers_per_lot: int = 25,
-    encoding_candidates: tuple[str, ...] = ("utf-8", "utf-8-sig", "cp932", "shift_jis"),
-    inspect: bool = False,
+    encoding_candidates: tuple[str, ...] = ("utf-8-sig", "utf-8", "cp932", "shift_jis"),
+    debug: bool = False,
 ) -> tuple[dict[str, int], dict[str, int], dict]:
     """
-    ids.csv から e_date ごとの lot数/wafer数を作る（列名は大小文字吸収）。
+    ids.csv から e_date ごとの lot数/wafer数を作る（列名は大小文字＆BOM吸収）。
     戻り値: (lots_by_edate, wafers_by_edate, info)
+
+    - WAFER_ID列があれば「ユニーク wafer_id 数」を採用
+    - 無ければ「ユニーク lot_id 数 × wafers_per_lot」で wafer数を見積もり
     """
-    want_e = e_date_col.strip().upper()
-    want_l = lot_col.strip().upper()
-    want_w = wafer_col.strip().upper()
+    want_e = normalize_colname(e_date_col)
+    want_l = normalize_colname(lot_col)
+    want_w = normalize_colname(wafer_col)
 
     last_err: Exception | None = None
+
     for enc in encoding_candidates:
         try:
-            text = ids_csv.read_text(encoding=enc, errors="replace")
-            lines = [ln for ln in text.splitlines() if ln.strip()]
-            if not lines:
-                raise ValueError("ids.csv seems empty")
+            # dialect 推定用のサンプル読み
+            with open(ids_csv, "r", encoding=enc, errors="replace", newline="") as f:
+                sample_lines = []
+                for _ in range(60):
+                    ln = f.readline()
+                    if not ln:
+                        break
+                    if ln.strip():
+                        sample_lines.append(ln)
+                sample = "".join(sample_lines)
 
-            # dialect検出（区切り文字の揺れ対応）
-            sample = "\n".join(lines[:50])
             dialect = sniff_dialect(sample)
 
-            # DictReaderはファイルオブジェクトが必要なので再オープン
-            lots_by = defaultdict(int)
-            wafers_by = defaultdict(int)
-
+            lots_set_by = defaultdict(set)    # e_date -> set(lot_id)
+            wafers_set_by = defaultdict(set)  # e_date -> set(wafer_id)
             total_rows = 0
             rows_with_edate = 0
             rows_with_lot = 0
@@ -160,28 +176,28 @@ def read_ids_counts_by_edate(
                 if not r.fieldnames:
                     raise ValueError("ids.csv has no header")
 
-                # ヘッダ正規化
-                header_upper = [h.strip().upper() for h in r.fieldnames if h is not None]
-                fns_upper = set(header_upper)
+                header_norm = [normalize_colname(h) for h in r.fieldnames if h is not None]
+                fns = set(header_norm)
 
-                if want_e not in fns_upper:
-                    raise ValueError(f"missing column: {want_e} (found={header_upper[:30]})")
+                if want_e not in fns:
+                    raise ValueError(f"missing column: {want_e} (found={header_norm[:30]})")
 
-                has_wafer = want_w in fns_upper
-                has_lot = want_l in fns_upper
-
-                sample_rows = []
+                has_wafer = want_w in fns
+                has_lot = want_l in fns
 
                 for row in r:
                     total_rows += 1
-                    row_u = {(k.strip().upper() if k else ""): (v if v is not None else "") for k, v in row.items()}
-                    ed_raw = row_u.get(want_e, "")
-                    lot_raw = row_u.get(want_l, "")
-                    waf_raw = row_u.get(want_w, "")
+                    row_u = {normalize_colname(k): (v if v is not None else "") for k, v in row.items()}
 
+                    ed_raw = str(row_u.get(want_e, "")).strip()
                     ed = normalize_edate(ed_raw)
-                    lot_ok = bool(str(lot_raw).strip())
-                    ed_ok = bool(str(ed).strip())
+                    ed_ok = bool(ed)
+
+                    lot_raw = str(row_u.get(want_l, "")).strip()
+                    lot_ok = bool(lot_raw)
+
+                    waf_raw = str(row_u.get(want_w, "")).strip()
+                    waf_ok = bool(waf_raw)
 
                     if ed_ok:
                         rows_with_edate += 1
@@ -190,35 +206,45 @@ def read_ids_counts_by_edate(
                     if ed_ok and lot_ok:
                         rows_with_both += 1
 
-                    if inspect and len(sample_rows) < 5:
-                        sample_rows.append(
-                            {"E_DATE_raw": ed_raw, "E_DATE_norm": ed, "LOT_ID": lot_raw, "WAFER_ID": waf_raw}
-                        )
-
                     if not ed_ok:
                         continue
 
-                    if has_wafer and str(waf_raw).strip():
-                        wafers_by[ed] += 1
+                    if has_wafer and waf_ok:
+                        wafers_set_by[ed].add(waf_raw)
                     elif has_lot and lot_ok:
-                        lots_by[ed] += 1
+                        lots_set_by[ed].add(lot_raw)
 
-            if not wafers_by:
-                # wafer列が無い運用：lot数×wafers_per_lot で見積もり
-                for ed, n_lots in lots_by.items():
-                    wafers_by[ed] = n_lots * wafers_per_lot
+            lots_by_edate = {ed: len(s) for ed, s in lots_set_by.items()}
+
+            if has_wafer and wafers_set_by:
+                wafers_by_edate = {ed: len(s) for ed, s in wafers_set_by.items()}
+            else:
+                # lot粒度のみ：lot数×25（デフォルト）
+                wafers_by_edate = {ed: n_lots * wafers_per_lot for ed, n_lots in lots_by_edate.items()}
 
             info = {
                 "encoding": enc,
                 "delimiter": getattr(dialect, "delimiter", ","),
-                "header_upper": header_upper,
+                "header_norm": header_norm,
                 "total_rows": total_rows,
                 "rows_with_edate": rows_with_edate,
                 "rows_with_lot": rows_with_lot,
                 "rows_with_both": rows_with_both,
-                "sample_rows": sample_rows,
+                "has_wafer_col": has_wafer,
+                "has_lot_col": has_lot,
             }
-            return dict(lots_by), dict(wafers_by), info
+
+            if debug:
+                # 最低限の診断だけ（--debug時のみ）
+                print(f"[DEBUG] ids_csv={ids_csv}")
+                print(f"[DEBUG] ids encoding={enc} delimiter={repr(info['delimiter'])}")
+                print(f"[DEBUG] ids header_norm={header_norm[:20]}")
+                print(f"[DEBUG] ids rows total={total_rows}, with_edate={rows_with_edate}, with_lot={rows_with_lot}, with_both={rows_with_both}")
+                print(f"[DEBUG] ids unique e_dates={len(set(list(lots_by_edate.keys()) + list(wafers_by_edate.keys())))}")
+                print(f"[DEBUG] ids planned lots(sum unique per e_date)={sum(lots_by_edate.values())}")
+                print(f"[DEBUG] ids planned wafers(est)={sum(wafers_by_edate.values())}")
+
+            return lots_by_edate, wafers_by_edate, info
 
         except Exception as e:
             last_err = e
@@ -252,10 +278,15 @@ def count_ope_groups(data_type: str) -> int:
         if isinstance(j, dict):
             if "groups" in j and isinstance(j["groups"], list):
                 return len(j["groups"])
-            if "enabled_columns" in j and isinstance(j["enabled_columns"], dict):
-                return len(j["enabled_columns"].keys())
 
-            # top-level dict as ope->cols
+            if "enabled_columns" in j:
+                ec = j["enabled_columns"]
+                if isinstance(ec, dict):
+                    return len(ec.keys())
+                if isinstance(ec, list):
+                    return len(ec)
+
+            # top-level dict as ope->cols（メタキー除外、値がlist/dictのキーのみ数える）
             keys = []
             for k, v in j.items():
                 if k in ("meta", "version", "created_at"):
@@ -275,6 +306,9 @@ def count_ope_groups(data_type: str) -> int:
 
 
 def estimate_ope_groups_from_runs(rows_all: list[dict], snapshot: str) -> dict[str, int]:
+    """
+    specsから取れない場合の保険：runsの job_key から dt別のopeユニーク数を推定
+    """
     seen = defaultdict(set)
     for r in rows_all:
         if r.get("snapshot") != snapshot:
@@ -291,6 +325,10 @@ def estimate_ope_groups_from_runs(rows_all: list[dict], snapshot: str) -> dict[s
 
 
 def infer_cls_by_data_type_from_runs(rows_all: list[dict], snapshot: str) -> dict[str, str]:
+    """
+    実行コードを変えない前提：cls は runs.jsonl の job_key から推定する。
+    未登場 data_type は ROW 扱い。
+    """
     cnt: dict[str, Counter] = defaultdict(Counter)
     for r in rows_all:
         if r.get("snapshot") != snapshot:
@@ -320,11 +358,14 @@ def calc_planned_jobs(
     cls_by_dt: dict[str, str],
     ids_per_job: dict[str, int],
     fallback_groups: int = 1,
-) -> tuple[int, dict[str, int], dict[str, int], list[str]]:
+    debug: bool = False,
+) -> tuple[int, dict[str, int], dict[str, int]]:
+    """
+    planned_jobs(dt) = groups(dt) * Σ_e_date ceil(n_ids(e_date, cls) / per_job(cls))
+    """
     planned_total = 0
     planned_by_dt = {}
     planned_by_cls = defaultdict(int)
-    warn = []
 
     groups_from_runs = estimate_ope_groups_from_runs(rows_all, snapshot)
 
@@ -332,18 +373,17 @@ def calc_planned_jobs(
         g = count_ope_groups(dt)
         if g <= 0:
             g = groups_from_runs.get(dt, 0)
-            if g > 0:
-                warn.append(f"[WARN] groups for {dt} inferred from runs (unique ope={g})")
-        if g <= 0 and fallback_groups > 0:
+        if g <= 0:
             g = fallback_groups
-            warn.append(f"[WARN] groups for {dt} fallback to {fallback_groups} (specs/runs unavailable)")
 
         cls = cls_by_dt.get(dt, "ROW")
         per_job = ids_per_job.get(cls)
         if not per_job:
-            warn.append(f"[WARN] per_job missing for cls={cls} (dt={dt}) -> skip")
+            if debug:
+                print(f"[DEBUG] skip dt={dt} (unknown per_job for cls={cls})")
             continue
 
+        # e_date毎にceil（重要）
         sum_chunks = 0
         if cls == "LOT":
             for n_lots in lots_by_edate.values():
@@ -359,7 +399,11 @@ def calc_planned_jobs(
         planned_by_cls[cls] += planned
         planned_total += planned
 
-    return planned_total, planned_by_dt, dict(planned_by_cls), warn
+        if debug:
+            src = "specs" if count_ope_groups(dt) > 0 else ("runs" if groups_from_runs.get(dt, 0) > 0 else "fallback")
+            print(f"[DEBUG] dt={dt} cls={cls} groups={g}({src}) sum_chunks={sum_chunks} planned={planned}")
+
+    return planned_total, planned_by_dt, dict(planned_by_cls)
 
 
 def main():
@@ -368,17 +412,17 @@ def main():
     ap.add_argument("--ids-csv", type=str, default=None, help="投入予定ids.csv（省略時は候補から探索）")
     ap.add_argument("--wafers-per-lot", type=int, default=25)
 
-    # 你のids.csv: LOT_ID / E_DATE
+    # ids.csv: LOT_ID / E_DATE（BOMありでもOK）
     ap.add_argument("--e-date-col", type=str, default="E_DATE")
     ap.add_argument("--lot-col", type=str, default="LOT_ID")
-    ap.add_argument("--wafer-col", type=str, default="WAFER_ID")
+    ap.add_argument("--wafer-col", type=str, default="WAFER_ID")  # 無ければlot換算に落ちる
 
     ap.add_argument("--per-job-row", type=int, default=DEFAULT_IDS_PER_JOB["ROW"])
     ap.add_argument("--per-job-wafer", type=int, default=DEFAULT_IDS_PER_JOB["WAFER"])
     ap.add_argument("--per-job-lot", type=int, default=DEFAULT_IDS_PER_JOB["LOT"])
 
-    ap.add_argument("--fallback-groups", type=int, default=1)
-    ap.add_argument("--inspect-ids", action="store_true", help="ids.csvのヘッダ/区切り/サンプル/有効行数を表示")
+    ap.add_argument("--fallback-groups", type=int, default=1, help="groupsが取れない時の最終fallback")
+    ap.add_argument("--debug", action="store_true", help="診断ログを出す")
     args = ap.parse_args()
 
     rows_all = load_runs_rows()
@@ -398,7 +442,7 @@ def main():
         lot_col=args.lot_col,
         wafer_col=args.wafer_col,
         wafers_per_lot=args.wafers_per_lot,
-        inspect=args.inspect_ids,
+        debug=args.debug,
     )
 
     planned_lots = sum(lots_by_edate.values())
@@ -407,7 +451,7 @@ def main():
 
     data_types = list_data_types_from_specs()
     if not data_types:
-        # 最悪 runs から推定
+        # 最悪 runs から推定（debug時のみ詳細）
         dts = set()
         for r in rows_all:
             if r.get("snapshot") != snap:
@@ -418,11 +462,13 @@ def main():
                 if dt:
                     dts.add(dt)
         data_types = sorted(dts)
+        if args.debug:
+            print(f"[DEBUG] meta/specs not found -> data_types inferred from runs: {len(data_types)}")
 
     cls_by_dt = infer_cls_by_data_type_from_runs(rows_all, snap)
     ids_per_job = {"ROW": args.per_job_row, "WAFER": args.per_job_wafer, "LOT": args.per_job_lot}
 
-    planned_jobs, planned_by_dt, planned_by_cls, warn = calc_planned_jobs(
+    planned_jobs, planned_by_dt, planned_by_cls = calc_planned_jobs(
         snapshot=snap,
         rows_all=rows_all,
         data_types=data_types,
@@ -431,9 +477,10 @@ def main():
         cls_by_dt=cls_by_dt,
         ids_per_job=ids_per_job,
         fallback_groups=args.fallback_groups,
+        debug=args.debug,
     )
 
-    # 実績（runs）
+    # --- 実績（runs） ---
     by_job: dict[str, dict] = {}
     for r in rows_all:
         if r.get("snapshot") != snap:
@@ -447,20 +494,10 @@ def main():
     raw_only = 0
     status_cnt = defaultdict(int)
 
-    done_by_dt = defaultdict(int)
-    seen_by_dt = defaultdict(int)
-
-    for jk, r in by_job.items():
-        k = parse_job_key(jk)
-        dt = k.get("data_type")
-        if dt:
-            seen_by_dt[dt] += 1
-
+    for r in by_job.values():
         if r.get("parquet_path"):
             done += 1
             status_cnt["parquet_ok"] += 1
-            if dt:
-                done_by_dt[dt] += 1
         elif r.get("raw_path"):
             raw_only += 1
             status_cnt["raw_only"] += 1
@@ -469,44 +506,54 @@ def main():
 
     seen = len(by_job)
 
-    # 出力
+    # --- Core output (通常時) ---
     print(f"snapshot: {snap}")
-    print(f"runs: {RUNS}")
-    print(f"ids_csv: {ids_csv} (size={ids_csv.stat().st_size} bytes)")
-    print(f"ids_csv encoding={ids_info['encoding']} delimiter={repr(ids_info['delimiter'])}")
-    print(f"ids_csv header={ids_info['header_upper'][:20]}")
-    print(f"ids_csv rows: total={ids_info['total_rows']}, with_E_DATE={ids_info['rows_with_edate']}, with_LOT_ID={ids_info['rows_with_lot']}, with_both={ids_info['rows_with_both']}")
-    if args.inspect_ids:
-        print("ids_csv sample_rows:")
-        for x in ids_info["sample_rows"]:
-            print(" ", x)
-
-    print(f"\nplanned e_dates: {planned_edates}")
+    print(f"planned e_dates: {planned_edates}")
     print(f"planned lots:   {planned_lots}")
     print(f"planned wafers: {planned_wafers}")
     print(f"planned data_types: {len(data_types)}")
     print(f"TOTAL planned jobs: {planned_jobs}")
-    for w in warn[:10]:
-        print(w)
-    if len(warn) > 10:
-        print(f"[WARN] ... and {len(warn)-10} more warnings")
 
     if planned_jobs > 0:
         done_ratio = done / planned_jobs
         seen_ratio = seen / planned_jobs
-        print("\nProgress (order-independent):")
+        print("\nProgress:")
         print(f"  done (parquet_ok): {done:7d}/{planned_jobs:7d} [{fmt_bar(done_ratio)}] {done_ratio*100:5.1f}%")
         print(f"  seen (attempted):  {seen:7d}/{planned_jobs:7d} [{fmt_bar(seen_ratio)}] {seen_ratio*100:5.1f}%")
         print(f"  raw_only:          {raw_only:7d}")
     else:
-        print("\n[ERROR] planned_jobs=0 → ids.csv側が実質0件扱いになっている可能性が高いです。")
-        print("  まずは `python scripts/progress.py --inspect-ids` で sample_rows を確認してください。")
+        print("\n[ERROR] planned_jobs=0 です。")
+        print("  ids.csv の LOT_ID/E_DATE が空扱いになっている、または groups 推定が全滅している可能性があります。")
+        print("  `--debug` を付けて ids.csv の header_norm / rows_with_both / dt別groups を確認してください。")
 
-    if status_cnt:
-        print("\nRun status breakdown:")
+    # --- Debug output (debug時のみ) ---
+    if args.debug:
+        print("\n[DEBUG] paths")
+        print(f"  ROOT={ROOT}")
+        print(f"  RUNS={RUNS} (exists={RUNS.exists()})")
+        print(f"  IDS={ids_csv} (size={ids_csv.stat().st_size} bytes)")
+
+        print("\n[DEBUG] ids.csv info")
+        print(f"  encoding={ids_info.get('encoding')} delimiter={repr(ids_info.get('delimiter'))}")
+        print(f"  header_norm={ids_info.get('header_norm', [])[:30]}")
+        print(f"  total_rows={ids_info.get('total_rows')}")
+        print(f"  rows_with_edate={ids_info.get('rows_with_edate')}")
+        print(f"  rows_with_lot={ids_info.get('rows_with_lot')}")
+        print(f"  rows_with_both={ids_info.get('rows_with_both')}")
+        print(f"  has_lot_col={ids_info.get('has_lot_col')} has_wafer_col={ids_info.get('has_wafer_col')}")
+
+        print("\n[DEBUG] run status breakdown")
         for k in sorted(status_cnt.keys()):
             if k not in ("parquet_ok", "raw_only"):
                 print(f"  {k}: {status_cnt[k]}")
+
+        print("\n[DEBUG] planned jobs by cls")
+        for cls, v in sorted(planned_by_cls.items(), key=lambda x: -x[1]):
+            print(f"  {cls:6s}: {v}")
+
+        print("\n[DEBUG] planned jobs by data_type (top 30)")
+        for dt, p in sorted(planned_by_dt.items(), key=lambda x: -x[1])[:30]:
+            print(f"  {dt:12s} planned={p}")
 
 
 if __name__ == "__main__":
