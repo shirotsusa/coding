@@ -2,22 +2,18 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
+from collections import Counter, defaultdict
 from pathlib import Path
-from collections import defaultdict
-from datetime import datetime
 
 RUNS = Path("lake/bronze/meta/runs/runs.jsonl")
 META = Path("lake/bronze/meta")
+SPECS = META / "specs"
 
-# 母数推定に使う「1 job あたりの対象ID数」
-# あなたの運用に合わせて調整してください（ROW/WAFERは wafer_id リストを分割する前提）
-IDS_PER_JOB_BY_CLS = {
-    "ROW": 1000,
-    "WAFER": 1000,
-    "LOT": 50,
-}
+# 1 job あたりの対象ID数（あなたの分割ルールに合わせる）
+DEFAULT_IDS_PER_JOB = {"ROW": 1000, "WAFER": 1000, "LOT": 50}
 
 
 def read_json(path: Path) -> dict:
@@ -35,132 +31,22 @@ def pick_latest_snapshot_from_runs(rows: list[dict]) -> str | None:
     return max(snaps) if snaps else None
 
 
-def pick_latest_snapshot_from_partitions() -> str | None:
-    base = META / "partitions"
-    if not base.exists():
-        return None
-    snaps = set()
-    for p in base.glob("data_type=*/e_date=*/snapshot=*/lot_ids.json"):
-        try:
-            snaps.add(_get_part_value(p, "snapshot"))
-        except Exception:
-            pass
-    return max(snaps) if snaps else None
-
-
 def best_record(a: dict, b: dict) -> dict:
-    """
-    同一job_keyの統合ポリシー：
-      parquet成功 > raw_only > ts新しい
-    """
+    # parquet成功 > raw_only > ts新しい
     a_ok = bool(a.get("parquet_path"))
     b_ok = bool(b.get("parquet_path"))
     if a_ok != b_ok:
         return a if a_ok else b
-
     a_raw = bool(a.get("raw_path"))
     b_raw = bool(b.get("raw_path"))
     if a_raw != b_raw:
         return a if a_raw else b
-
     return a if a.get("ts", "") >= b.get("ts", "") else b
 
 
-def _get_part_value(path: Path, prefix: str) -> str:
-    """
-    path（lot_ids.json）から上位を辿って prefix=... の値を探す。
-    階層変更に強くするための保険。
-    """
-    for p in [path] + list(path.parents):
-        name = p.name
-        if name.startswith(prefix + "="):
-            return name.split("=", 1)[1]
-    raise ValueError(f"missing {prefix}=... in path: {path}")
-
-
-def count_ope_groups(data_type: str) -> int:
-    p = META / "specs" / f"data_type={data_type}" / "enabled_columns.json"
-    if not p.exists():
-        return 0
-    j = read_json(p)
-    return len(j.get("groups", []))
-
-
-def resolve_cls(snapshot: str, data_type: str, e_date: str) -> str | None:
-    lineage_path = META / "lineage" / f"data_type={data_type}" / f"e_date={e_date}" / f"snapshot={snapshot}" / "lineage.json"
-    if not lineage_path.exists():
-        return None
-    lineage = read_json(lineage_path)
-    default_cls = lineage.get("default_cls", "ROW")
-    overrides = lineage.get("sheet_to_cls_overrides", {}) or {}
-    return overrides.get(data_type, default_cls)
-
-
-def iter_partitions(snapshot: str):
-    """
-    meta/partitions から snapshot に一致する lot_ids.json を列挙する。
-    期待する例：
-      meta/partitions/data_type=DS_CHAR/e_date=2026-04-01/snapshot=.../lot_ids.json
-    """
-    base = META / "partitions"
-    if not base.exists():
-        return
-    for lot_ids_json in base.glob(f"data_type=*/e_date=*/snapshot={snapshot}/lot_ids.json"):
-        try:
-            data_type = _get_part_value(lot_ids_json, "data_type")
-            e_date = _get_part_value(lot_ids_json, "e_date")
-            yield data_type, e_date, lot_ids_json
-        except Exception:
-            yield None, None, lot_ids_json
-
-
-def expected_jobs_for_partition(snapshot: str, data_type: str, e_date: str, lot_ids_json: Path) -> tuple[int, dict]:
-    """
-    期待job数 = (opeグループ数) × ceil(対象ID数 / ids_per_job(cls))
-    対象ID数：cls=ROW/WAFER -> n_wafers, cls=LOT -> n_lots
-    """
-    if not data_type or not e_date:
-        return 0, {"reason": "bad_partition_path", "path": str(lot_ids_json)}
-
-    part = read_json(lot_ids_json)
-    n_wafers = int(part.get("n_wafers", 0))
-    n_lots = int(part.get("n_lots", 0))
-
-    cls = resolve_cls(snapshot, data_type, e_date)
-    if not cls:
-        return 0, {"reason": "missing_lineage", "data_type": data_type, "e_date": e_date}
-
-    per_job = IDS_PER_JOB_BY_CLS.get(cls)
-    if not per_job:
-        return 0, {"reason": "missing_ids_per_job", "cls": cls, "data_type": data_type, "e_date": e_date}
-
-    ope_groups = count_ope_groups(data_type)
-    if ope_groups == 0:
-        return 0, {"reason": "missing_enabled_columns", "data_type": data_type, "e_date": e_date}
-
-    if cls in ("ROW", "WAFER"):
-        n_ids = n_wafers
-    elif cls == "LOT":
-        n_ids = n_lots
-    else:
-        return 0, {"reason": "unknown_cls", "cls": cls, "data_type": data_type, "e_date": e_date}
-
-    n_chunks = math.ceil(n_ids / per_job) if n_ids > 0 else 0
-    expected = ope_groups * n_chunks
-
-    info = {
-        "data_type": data_type,
-        "e_date": e_date,
-        "cls": cls,
-        "n_wafers": n_wafers,
-        "n_lots": n_lots,
-        "n_ids": n_ids,
-        "per_job": per_job,
-        "n_chunks": n_chunks,
-        "ope_groups": ope_groups,
-        "expected": expected,
-    }
-    return expected, info
+def fmt_bar(ratio: float, width: int = 40) -> str:
+    ratio = 0.0 if ratio < 0 else (1.0 if ratio > 1 else ratio)
+    return ("#" * int(ratio * width)).ljust(width, "-")
 
 
 def parse_job_key(jk: str) -> dict:
@@ -177,45 +63,278 @@ def parse_job_key(jk: str) -> dict:
     return out
 
 
-def fmt_bar(ratio: float, width: int = 40) -> str:
-    ratio = 0.0 if ratio < 0 else (1.0 if ratio > 1 else ratio)
-    return ("#" * int(ratio * width)).ljust(width, "-")
+def normalize_edate(s: str) -> str:
+    s = (s or "").strip()
+    if not s:
+        return s
+    # 2025/04/17 -> 2025-04-17
+    if "/" in s:
+        parts = s.split("/")
+        if len(parts) == 3 and all(p.isdigit() for p in parts):
+            y, m, d = parts
+            return f"{int(y):04d}-{int(m):02d}-{int(d):02d}"
+    # 20250417 -> 2025-04-17
+    if len(s) == 8 and s.isdigit():
+        return f"{s[:4]}-{s[4:6]}-{s[6:]}"
+    return s
+
+
+def guess_ids_csv_path(explicit: str | None) -> Path | None:
+    if explicit:
+        p = Path(explicit)
+        return p if p.exists() else None
+
+    candidates = [
+        Path("ids.csv"),
+        META / "ids.csv",
+        META / "inputs" / "ids.csv",
+        META / "input" / "ids.csv",
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    return None
+
+
+def read_ids_counts_by_edate(
+    ids_csv: Path,
+    *,
+    e_date_col: str = "E_DATE",
+    lot_col: str = "LOT_ID",
+    wafer_col: str = "WAFER_ID",
+    wafers_per_lot: int = 25,
+    encoding_candidates: tuple[str, ...] = ("utf-8", "utf-8-sig", "cp932", "shift_jis"),
+) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
+    """
+    ids.csv から e_date ごとの counts を作る（列名は大小文字を吸収）。
+    戻り値: (lots_by_edate, wafers_by_edate, rows_by_edate)
+      - wafer列があれば wafers_by_edate はその行数
+      - wafer列が無ければ wafers_by_edate = lots_by_edate * wafers_per_lot
+    """
+    want_e = e_date_col.strip().upper()
+    want_l = lot_col.strip().upper()
+    want_w = wafer_col.strip().upper()
+
+    last_err: Exception | None = None
+    for enc in encoding_candidates:
+        try:
+            lots_by = defaultdict(int)
+            wafers_by = defaultdict(int)
+            rows_by = defaultdict(int)
+
+            with open(ids_csv, "r", encoding=enc, errors="replace", newline="") as f:
+                r = csv.DictReader(f)
+                if not r.fieldnames:
+                    raise ValueError("ids.csv has no header")
+
+                fns_upper = {c.strip().upper() for c in r.fieldnames if c is not None}
+                if want_e not in fns_upper:
+                    raise ValueError(f"missing column: {want_e} (found={sorted(fns_upper)[:20]}...)")
+
+                has_wafer = want_w in fns_upper
+                has_lot = want_l in fns_upper
+
+                for row in r:
+                    # 行キーを大文字に正規化
+                    row_u = {(k.strip().upper() if k else ""): (v if v is not None else "") for k, v in row.items()}
+                    ed = normalize_edate(row_u.get(want_e, ""))
+                    if not ed:
+                        continue
+
+                    rows_by[ed] += 1
+
+                    if has_wafer and row_u.get(want_w, "").strip():
+                        wafers_by[ed] += 1
+                    elif has_lot and row_u.get(want_l, "").strip():
+                        lots_by[ed] += 1
+
+            if not wafers_by:
+                # wafer列が無い運用：lot数×wafers_per_lot で見積もり
+                for ed, n_lots in lots_by.items():
+                    wafers_by[ed] = n_lots * wafers_per_lot
+
+            return dict(lots_by), dict(wafers_by), dict(rows_by)
+
+        except Exception as e:
+            last_err = e
+            continue
+
+    raise RuntimeError(f"failed to read ids.csv: {ids_csv}") from last_err
+
+
+def list_data_types_from_specs() -> list[str]:
+    if not SPECS.exists():
+        return []
+    dts = []
+    for p in SPECS.glob("data_type=*"):
+        name = p.name
+        if name.startswith("data_type="):
+            dts.append(name.split("=", 1)[1])
+    return sorted(set(dts))
+
+
+def count_ope_groups(data_type: str) -> int:
+    p = SPECS / f"data_type={data_type}" / "enabled_columns.json"
+    if not p.exists():
+        return 0
+    j = read_json(p)
+    return len(j.get("groups", []))
+
+
+def infer_cls_by_data_type_from_runs(rows_all: list[dict], snapshot: str) -> dict[str, str]:
+    """
+    実行コードを変えない前提なので、clsは runs.jsonl の job_key から推定する。
+    未登場 data_type は ROW とみなす（あなたの基本運用に合わせる）。
+    """
+    cnt: dict[str, Counter] = defaultdict(Counter)
+    for r in rows_all:
+        if r.get("snapshot") != snapshot:
+            continue
+        jk = r.get("job_key")
+        if not jk:
+            continue
+        k = parse_job_key(jk)
+        dt = k.get("data_type")
+        cls = k.get("cls")
+        if dt and cls:
+            cnt[dt][cls] += 1
+
+    out = {}
+    for dt, c in cnt.items():
+        out[dt] = c.most_common(1)[0][0]
+    return out
+
+
+def calc_planned_jobs(
+    *,
+    data_types: list[str],
+    lots_by_edate: dict[str, int],
+    wafers_by_edate: dict[str, int],
+    cls_by_dt: dict[str, str],
+    ids_per_job: dict[str, int],
+) -> tuple[int, dict[str, int], dict[str, int]]:
+    """
+    planned_jobs(dt) = ope_groups(dt) * Σ_e_date ceil(n_ids(e_date, cls) / per_job(cls))
+    """
+    planned_total = 0
+    planned_by_dt = {}
+    planned_by_cls = defaultdict(int)
+
+    for dt in data_types:
+        groups = count_ope_groups(dt)
+        if groups == 0:
+            continue
+
+        cls = cls_by_dt.get(dt, "ROW")
+        per_job = ids_per_job.get(cls)
+        if not per_job:
+            continue
+
+        sum_chunks = 0
+        if cls == "LOT":
+            for _, n_lots in lots_by_edate.items():
+                if n_lots > 0:
+                    sum_chunks += math.ceil(n_lots / per_job)
+        else:
+            for _, n_waf in wafers_by_edate.items():
+                if n_waf > 0:
+                    sum_chunks += math.ceil(n_waf / per_job)
+
+        planned = groups * sum_chunks
+        planned_by_dt[dt] = planned
+        planned_by_cls[cls] += planned
+        planned_total += planned
+
+    return planned_total, planned_by_dt, dict(planned_by_cls)
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--snapshot", type=str, default=None, help="対象snapshot（省略時はruns.jsonlの最新）")
+    ap.add_argument("--ids-csv", type=str, default=None, help="投入予定のids.csvパス（省略時は候補から自動探索）")
+    ap.add_argument("--wafers-per-lot", type=int, default=25, help="lot→wafer換算（ids.csvがlot粒度のとき）")
+
+    # ★あなたの ids.csv（LOT_ID / E_DATE）に合わせてデフォルトを大文字に変更
+    ap.add_argument("--e-date-col", type=str, default="E_DATE")
+    ap.add_argument("--lot-col", type=str, default="LOT_ID")
+    ap.add_argument("--wafer-col", type=str, default="WAFER_ID")  # 存在しないなら自動でlot換算に落ちる
+
+    ap.add_argument("--per-job-row", type=int, default=DEFAULT_IDS_PER_JOB["ROW"])
+    ap.add_argument("--per-job-wafer", type=int, default=DEFAULT_IDS_PER_JOB["WAFER"])
+    ap.add_argument("--per-job-lot", type=int, default=DEFAULT_IDS_PER_JOB["LOT"])
     args = ap.parse_args()
 
     rows_all = load_runs_rows()
-
-    # snapshot決定：基本はruns優先、runsが無ければpartitionsから
-    snap = args.snapshot
+    snap = args.snapshot or pick_latest_snapshot_from_runs(rows_all)
     if not snap:
-        snap = pick_latest_snapshot_from_runs(rows_all) if rows_all else None
-    if not snap:
-        snap = pick_latest_snapshot_from_partitions()
-
-    if not snap:
-        print("snapshot が見つかりません（runs.jsonl/partitionsを確認してください）")
+        print(f"runs.jsonl not found or empty: {RUNS}")
         return
 
-    # --- 実績（runs）集計 ---
+    ids_csv = guess_ids_csv_path(args.ids_csv)
+    if not ids_csv:
+        print("ids.csv が見つかりません。--ids-csv で投入予定ids.csvを指定してください。")
+        return
+
+    lots_by_edate, wafers_by_edate, rows_by_edate = read_ids_counts_by_edate(
+        ids_csv,
+        e_date_col=args.e_date_col,
+        lot_col=args.lot_col,
+        wafer_col=args.wafer_col,
+        wafers_per_lot=args.wafers_per_lot,
+    )
+    planned_lots = sum(lots_by_edate.values())
+    planned_wafers = sum(wafers_by_edate.values())
+    planned_edates = len(set(list(lots_by_edate.keys()) + list(wafers_by_edate.keys())))
+
+    data_types = list_data_types_from_specs()
+    if not data_types:
+        print(f"meta/specs が見つかりません: {SPECS}")
+        return
+
+    cls_by_dt = infer_cls_by_data_type_from_runs(rows_all, snap)
+
+    ids_per_job = {
+        "ROW": args.per_job_row,
+        "WAFER": args.per_job_wafer,
+        "LOT": args.per_job_lot,
+    }
+
+    planned_jobs, planned_by_dt, planned_by_cls = calc_planned_jobs(
+        data_types=data_types,
+        lots_by_edate=lots_by_edate,
+        wafers_by_edate=wafers_by_edate,
+        cls_by_dt=cls_by_dt,
+        ids_per_job=ids_per_job,
+    )
+
+    # --- 実績（runs） ---
     by_job: dict[str, dict] = {}
-    if rows_all:
-        rows = [r for r in rows_all if r.get("snapshot") == snap and r.get("job_key")]
-        for r in rows:
-            jk = r["job_key"]
-            by_job[jk] = r if jk not in by_job else best_record(by_job[jk], r)
+    for r in rows_all:
+        if r.get("snapshot") != snap:
+            continue
+        jk = r.get("job_key")
+        if not jk:
+            continue
+        by_job[jk] = r if jk not in by_job else best_record(by_job[jk], r)
 
     done = 0
     raw_only = 0
     status_cnt = defaultdict(int)
 
-    for r in by_job.values():
+    done_by_dt = defaultdict(int)
+    seen_by_dt = defaultdict(int)
+
+    for jk, r in by_job.items():
+        k = parse_job_key(jk)
+        dt = k.get("data_type")
+        if dt:
+            seen_by_dt[dt] += 1
+
         if r.get("parquet_path"):
             done += 1
             status_cnt["parquet_ok"] += 1
+            if dt:
+                done_by_dt[dt] += 1
         elif r.get("raw_path"):
             raw_only += 1
             status_cnt["raw_only"] += 1
@@ -224,91 +343,48 @@ def main():
 
     seen = len(by_job)
 
-    # --- 母数（planned/expected）集計 ---
-    expected_total = 0
-    planned_partitions = 0
-    total_wafers = 0
-    total_lots = 0
-
-    exp_detail: list[dict] = []
-    issues: list[dict] = []
-    expected_by_cls = defaultdict(int)
-    expected_by_data_type = defaultdict(int)
-
-    for data_type, e_date, lot_ids_json in iter_partitions(snap):
-        exp, info = expected_jobs_for_partition(snap, data_type, e_date, lot_ids_json)
-        if exp > 0:
-            expected_total += exp
-            planned_partitions += 1
-            total_wafers += int(info.get("n_wafers", 0))
-            total_lots += int(info.get("n_lots", 0))
-            exp_detail.append(info)
-            expected_by_cls[str(info["cls"])] += exp
-            expected_by_data_type[str(info["data_type"])] += exp
-        else:
-            issues.append(info)
-
     # --- 出力 ---
     print(f"snapshot: {snap}")
-    print(f"planned partitions (data_type×e_date): {planned_partitions}")
-    print(f"planned lots:   {total_lots}")
-    print(f"planned wafers: {total_wafers}")
-    print(f"TOTAL expected jobs: {expected_total}")
+    print(f"ids_csv: {ids_csv}")
+    print(f"planned e_dates: {planned_edates}")
+    if planned_lots > 0:
+        print(f"planned lots:   {planned_lots}")
+    print(f"planned wafers: {planned_wafers}")
+    print(f"planned data_types (from meta/specs): {len(data_types)}")
+    print(f"TOTAL planned jobs: {planned_jobs}")
 
-    if expected_total > 0:
-        done_ratio = done / expected_total
-        seen_ratio = seen / expected_total
-        print(f"\nProgress:")
-        print(f"  done (parquet_ok): {done:7d}/{expected_total:7d} [{fmt_bar(done_ratio)}] {done_ratio*100:5.1f}%")
-        print(f"  seen (attempted):  {seen:7d}/{expected_total:7d} [{fmt_bar(seen_ratio)}] {seen_ratio*100:5.1f}%")
+    if planned_jobs > 0:
+        done_ratio = done / planned_jobs
+        seen_ratio = seen / planned_jobs
+        print("\nProgress (order-independent):")
+        print(f"  done (parquet_ok): {done:7d}/{planned_jobs:7d} [{fmt_bar(done_ratio)}] {done_ratio*100:5.1f}%")
+        print(f"  seen (attempted):  {seen:7d}/{planned_jobs:7d} [{fmt_bar(seen_ratio)}] {seen_ratio*100:5.1f}%")
         print(f"  raw_only:          {raw_only:7d}")
+        if seen > planned_jobs:
+            print(f"\n[WARN] seen({seen}) > planned_jobs({planned_jobs}).")
+            print("      planned側の推定条件（ids.csv/specs/分割条件）がズレている可能性があります。")
     else:
         print("\nProgress:")
-        print("  expected_total=0 のため割合を計算できません（meta/specs/lineage/partitionsの欠落を疑ってください）")
-        print(f"  done(parquet_ok): {done}, seen: {seen}, raw_only: {raw_only}")
+        print("  planned_jobs=0 のため割合を計算できません（meta/specs/enabled_columns.json を確認）")
 
-    # 失敗内訳
     if status_cnt:
-        print("\nRun status breakdown (runs.jsonl):")
+        print("\nRun status breakdown:")
         for k in sorted(status_cnt.keys()):
             if k not in ("parquet_ok", "raw_only"):
                 print(f"  {k}: {status_cnt[k]}")
 
-    # cls別の予定job数
-    if expected_by_cls:
-        print("\nExpected jobs by cls:")
-        for cls, v in sorted(expected_by_cls.items(), key=lambda x: -x[1]):
+    if planned_by_cls:
+        print("\nPlanned jobs by cls:")
+        for cls, v in sorted(planned_by_cls.items(), key=lambda x: -x[1]):
             print(f"  {cls:6s}: {v}")
 
-    # data_type別：予定と実績を並べる
-    # 実績側（done/seen）をdata_type別に数える
-    done_by_dt = defaultdict(int)
-    seen_by_dt = defaultdict(int)
-    for jk, r in by_job.items():
-        k = parse_job_key(jk)
-        dt = k.get("data_type")
-        if not dt:
-            continue
-        seen_by_dt[dt] += 1
-        if r.get("parquet_path"):
-            done_by_dt[dt] += 1
-
-    if expected_by_data_type:
-        print("\nBy data_type (expected vs done/seen):")
-        # expectedが多い順に表示
-        for dt, exp in sorted(expected_by_data_type.items(), key=lambda x: -x[1])[:30]:
+    if planned_by_dt:
+        print("\nBy data_type (planned vs done/seen):")
+        for dt, p in sorted(planned_by_dt.items(), key=lambda x: -x[1])[:30]:
             d = done_by_dt.get(dt, 0)
             s = seen_by_dt.get(dt, 0)
-            rr = (d / exp * 100) if exp else 0.0
-            print(f"  {dt:12s} expected={exp:8d}  done={d:8d}  seen={s:8d}  done%={rr:5.1f}%")
-
-    # 計算から漏れたpartitionがあると expected_total が過小評価になるので警告
-    if issues:
-        print("\n[WARN] Some partitions were skipped (expected_total may be undercounted):")
-        for x in issues[:12]:
-            print(" ", x)
-        if len(issues) > 12:
-            print(f"  ... and {len(issues)-12} more")
+            rr = (d / p * 100) if p else 0.0
+            print(f"  {dt:12s} planned={p:7d}  done={d:7d}  seen={s:7d}  done%={rr:5.1f}%")
 
 
 if __name__ == "__main__":
