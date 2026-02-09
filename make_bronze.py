@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import shutil
@@ -177,6 +178,60 @@ def csv_to_parquet(csv_path: Path, pq_path: Path, *, infer_schema_length: int) -
             last_err = e
 
     raise RuntimeError(f"CSV→Parquet変換失敗: {csv_path}") from last_err
+
+# Spotfire風の型名（2行目）→ Polars読み込み型
+# Timestampは一旦Utf8にして、後でstrptimeでDatetimeへ
+TYPE_MAP = {
+    "INTEGER":  pl.Int64,
+    "DECIMAL":  pl.Float32,  
+    "STRING":   pl.Utf8,
+    "TIMESTAMP": pl.Utf8,
+    "Boolean": pl.Boolean,
+    
+}
+
+TS_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+def schema_and_ts_cols_from_2lines(csv_path: Path, encoding: str = "utf-8") -> tuple[dict[str, pl.DataType], list[str]]:
+    with open(csv_path, "r", encoding=encoding, errors="replace", newline="") as f:
+        r = csv.reader(f)
+        header = next(r)
+        typerow = next(r)
+
+    if len(header) != len(typerow):
+        raise ValueError(f"headerと型行の列数不一致: {len(header)} vs {len(typerow)}")
+
+    schema: dict[str, pl.DataType] = {}
+    ts_cols: list[str] = []
+    for col, t in zip(header, typerow):
+        key = str(t).strip().upper()
+        dt = TYPE_MAP.get(key, pl.Utf8)
+        schema[col] = dt
+        if key == "TIMESTAMP":
+            ts_cols.append(col)
+    return schema, ts_cols
+
+def csv_to_parquet_typed(csv_path: Path, pq_path: Path, *, encoding: str = "utf-8") -> None:
+    schema, ts_cols = schema_and_ts_cols_from_2lines(csv_path, encoding=encoding)
+
+    lf = pl.scan_csv(
+        str(csv_path),
+        has_header=True,
+        skip_rows_after_header=1,   # 2行目（型行）をスキップ
+        schema_overrides=schema,    # 推論なしで型固定（TimestampはUtf8のまま）
+        infer_schema_length=0,
+        null_values=["", "NULL", "NA"],
+    )
+
+    # Timestamp列を確実にDatetime化（例: 2025-04-17 06:13:38）
+    if ts_cols:
+        lf = lf.with_columns([
+            pl.col(c).str.strptime(pl.Datetime, TS_FORMAT, strict=False).alias(c)
+            for c in ts_cols
+        ])
+
+    pq_path.parent.mkdir(parents=True, exist_ok=True)
+    lf.sink_parquet(str(pq_path), compression="zstd")
 
 def chunks(seq: list[str], n: int) -> Iterable[list[str]]:
     for i in range(0, len(seq), n):
@@ -431,10 +486,11 @@ def normalize_one_job(
 
     if raw_ok:
         try:
-            csv_to_parquet(csv_path, pq_path, infer_schema_length=cfg.infer_schema_length)
+            csv_to_parquet_typed(csv_path, pq_path)  # ★先頭2行から型を確定してParquet化
         except Exception as e:
             pq_ok = False
             pq_err = repr(e)
+
     else:
         pq_ok = False
 
